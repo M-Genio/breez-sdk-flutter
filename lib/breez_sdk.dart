@@ -1,9 +1,10 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import 'package:breez_sdk/bridge_generated.dart';
 import 'package:breez_sdk/exceptions.dart';
 import 'package:breez_sdk/native_toolkit.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:rxdart/rxdart.dart';
 
 class BreezSDK {
@@ -12,59 +13,57 @@ class BreezSDK {
   BreezSDK();
 
   /* Streams */
-  /// Listen to paid Invoice events
-  final StreamController<InvoicePaidDetails> _invoicePaidStream = BehaviorSubject<InvoicePaidDetails>();
 
+  final StreamController<InvoicePaidDetails> _invoicePaidStream = StreamController.broadcast();
+
+  /// Listen to paid Invoice events
   Stream<InvoicePaidDetails> get invoicePaidStream => _invoicePaidStream.stream;
 
-  /// Listen to payment results
-  final StreamController<Payment> _paymentResultStream = BehaviorSubject<Payment>();
+  final StreamController<Payment> _paymentResultStream = StreamController.broadcast();
 
+  /// Listen to payment results
   Stream<Payment> get paymentResultStream => _paymentResultStream.stream;
 
+  /* SDK Streams */
+
+  StreamSubscription<BreezEvent>? _breezEventsSubscription;
+  StreamSubscription<LogEntry>? _breezLogSubscription;
+
+  Stream<BreezEvent>? _breezEventsStream;
+  Stream<LogEntry>? _breezLogStream;
+
+  /// Initializes SDK events & log streams.
+  ///
+  /// Call once on your Dart entrypoint file, e.g.; `lib/main.dart`.
   void initialize() {
-    /// Listen to BreezEvent's(new block, invoice paid, synced)
-    _lnToolkit.breezEventsStream().listen((event) async {
-      if (event is BreezEvent_InvoicePaid) {
-        _invoicePaidStream.add(event.details);
-        await fetchNodeData();
-      }
-      if (event is BreezEvent_Synced) {
-        await fetchNodeData();
-      }
-      if (event is BreezEvent_PaymentSucceed) {
-        _paymentResultStream.add(event.details);
-      }
-      if (event is BreezEvent_PaymentFailed) {
-        _paymentResultStream.addError(PaymentException(event.details));
-      }
-      if (event is BreezEvent_BackupSucceeded) {
-        _backupStreamController.add(event);
-      }
-      if (event is BreezEvent_BackupStarted) {
-        _backupStreamController.add(event);
-      }
-      if (event is BreezEvent_BackupFailed) {
-        _backupStreamController.addError(BackupException(event.details));
-      }
-    });
-    _lnToolkit.breezLogStream().listen((logEntry) {
-      _logStreamController.add(logEntry);
-    }, onError: (e) {
-      _logStreamController.addError(e);
-    });
+    _initializeEventsStream();
+    _initializeLogStream();
   }
+
+  void _initializeEventsStream() {
+    _breezEventsStream ??= _lnToolkit.breezEventsStream().asBroadcastStream();
+  }
+
+  void _initializeLogStream() {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      _breezLogStream ??= const EventChannel('breez_sdk_node_logs')
+          .receiveBroadcastStream()
+          .map((log) => LogEntry(line: log["line"], level: log["level"]));
+    } else {
+      _breezLogStream ??= _lnToolkit.breezLogStream().asBroadcastStream();
+    }
+  }
+
+  /* Breez Services API's & Streams*/
 
   final _logStreamController = StreamController<LogEntry>.broadcast();
 
   /// Listen to log events
   Stream<LogEntry> get logStream => _logStreamController.stream;
 
-  /* Breez Services API's & Streams*/
-
-  /// Listen to node state
   final StreamController<NodeState?> nodeStateController = BehaviorSubject<NodeState?>();
 
+  /// Listen to node state
   Stream<NodeState?> get nodeStateStream => nodeStateController.stream;
 
   /// Register for webhook callbacks at the given `webhook_url` whenever a new payment is received.
@@ -74,23 +73,27 @@ class BreezSDK {
     return _lnToolkit.registerWebhook(webhookUrl: webhookUrl);
   }
 
+  /// Unregister webhook callbacks for the given `webhook_url`.
+  Future<void> unregisterWebhook({required String webhookUrl}) async {
+    return _lnToolkit.unregisterWebhook(webhookUrl: webhookUrl);
+  }
+
   /// connect initializes the global NodeService, schedule the node to run in the cloud and
   /// run the signer. This must be called in order to start communicate with the node
   ///
   /// # Arguments
   ///
-  /// * `config` - The sdk configuration
-  /// * `seed` - The node private key
+  /// * `req` - The connect request containing the `config` sdk configuration and `seed` node private key
   Future connect({
-    required Config config,
-    required Uint8List seed,
+    required ConnectRequest req,
   }) async {
-    await _lnToolkit.connect(
-      config: config,
-      seed: seed,
-    );
+    await _lnToolkit.connect(req: req);
+    _subscribeToSdkStreams();
     await fetchNodeData();
   }
+
+  /// Retrieve the decrypted credentials from the node.
+  Future<NodeCredentials?> nodeCredentials() async => await _lnToolkit.nodeCredentials();
 
   /// Check whether node service is initialized or not
   Future<bool> isInitialized() async => await _lnToolkit.isInitialized();
@@ -109,8 +112,18 @@ class BreezSDK {
     return nodeState;
   }
 
+  /// Configure an optional address to send funds to during a mutual channel close
+  Future<void> configureNode({
+    required ConfigureNodeRequest req,
+  }) async {
+    return await _lnToolkit.configureNode(req: req);
+  }
+
   /// Cleanup node resources and stop the signer.
-  Future<void> disconnect() async => await _lnToolkit.disconnect();
+  Future<void> disconnect() async {
+    await _lnToolkit.disconnect();
+    _unsubscribeFromSdkStreams();
+  }
 
   /* Breez Services Helper API's */
 
@@ -221,6 +234,14 @@ class BreezSDK {
     return await _lnToolkit.paymentByHash(hash: hash);
   }
 
+  /// Set the external metadata of a payment as a valid JSON string
+  Future<void> setPaymentMetadata({
+    required String hash,
+    required String metadata,
+  }) async {
+    return await _lnToolkit.setPaymentMetadata(hash: hash, metadata: metadata);
+  }
+
   /* Lightning Payment API's */
 
   /// pay a bolt11 invoice
@@ -292,13 +313,24 @@ class BreezSDK {
   /// List all available fiat currencies
   Future<List<FiatCurrency>> listFiatCurrencies() async => await _lnToolkit.listFiatCurrencies();
 
+  /* Swap Stream */
+
+  final StreamController<BreezEvent_SwapUpdated> _swapEventsStreamController =
+      BehaviorSubject<BreezEvent_SwapUpdated>();
+
+  Stream<BreezEvent_SwapUpdated> get swapEventsStream => _swapEventsStreamController.stream;
+
   /* On-Chain Swap API's */
 
+  Future<OnchainPaymentLimitsResponse> onchainPaymentLimits() async {
+    return await _lnToolkit.onchainPaymentLimits();
+  }
+
   /// Creates a reverse swap and attempts to pay the HODL invoice
-  Future<SendOnchainResponse> sendOnchain({
-    required SendOnchainRequest req,
+  Future<PayOnchainResponse> payOnchain({
+    required PayOnchainRequest req,
   }) async {
-    return await _lnToolkit.sendOnchain(req: req);
+    return await _lnToolkit.payOnchain(req: req);
   }
 
   /// Onchain receive swap API
@@ -324,15 +356,6 @@ class BreezSDK {
     return redeemOnchainFundsResponse;
   }
 
-  /// Returns the max amount that can be sent on-chain using the send_onchain method.
-  /// The returned amount is the sum of the max amount that can be sent on each channel
-  /// minus the expected fees.
-  /// This is possible since the route to the swapper node is known in advance and is expected
-  /// to consist of maximum 3 hops.
-  Future<MaxReverseSwapAmountResponse> maxReverseSwapAmount() async {
-    return await _lnToolkit.maxReverseSwapAmount();
-  }
-
   /* Refundables API's */
 
   /// list non-completed expired swaps that should be refunded by calling refund()
@@ -355,14 +378,39 @@ class BreezSDK {
     return await _lnToolkit.prepareRefund(req: req);
   }
 
+  /// Iterate all historical swap addresses and fetch their current status from the blockchain.
+  /// The status is then updated in the persistent storage.
+  Future<void> rescanSwaps() async => await _lnToolkit.rescanSwaps();
+
   /* In Progress Swap API's */
 
   /// Returns an optional in-progress [SwapInfo].
   /// A [SwapInfo] is in-progress if it is waiting for confirmation to be redeemed and complete the swap.
   Future<SwapInfo?> inProgressSwap() async => await _lnToolkit.inProgressSwap();
 
-  /// Returns the blocking [ReverseSwapInfo]s that are in progress
-  Future<List<ReverseSwapInfo>> inProgressReverseSwaps() async => _lnToolkit.inProgressReverseSwaps();
+  /// Redeems an individual swap.
+  ///
+  /// To be used only in the context of mobile notifications, where the notification triggers
+  /// an individual redeem.
+  ///
+  /// This is taken care of automatically in the context of typical SDK usage.
+  Future<void> redeemSwap({
+    required String swapAddress,
+  }) async {
+    return await _lnToolkit.redeemSwap(swapAddress: swapAddress);
+  }
+
+  /// Claims an individual reverse swap.
+  ///
+  /// To be used only in the context of mobile notifications, where the notification triggers
+  /// an individual reverse swap to be claimed.
+  ///
+  /// This is taken care of automatically in the context of typical SDK usage.
+  Future<void> claimReverseSwap({
+    required String lockupAddress,
+  }) async {
+    return await _lnToolkit.claimReverseSwap(lockupAddress: lockupAddress);
+  }
 
   /* Swap Fee API's */
 
@@ -374,11 +422,25 @@ class BreezSDK {
   }
 
   /// Lookup the most recent reverse swap pair info using the Boltz API
+  @Deprecated(
+    'Use prepareOnchainPayment instead. '
+    'This method was deprecated after v0.3.2',
+  )
   Future<ReverseSwapPairInfo> fetchReverseSwapFees({
     required ReverseSwapFeesRequest req,
   }) async {
     return await _lnToolkit.fetchReverseSwapFees(req: req);
   }
+
+  /// Lookup the most recent reverse swap pair info using the Boltz API
+  Future<PrepareOnchainPaymentResponse> prepareOnchainPayment({
+    required PrepareOnchainPaymentRequest req,
+  }) async {
+    return await _lnToolkit.prepareOnchainPayment(req: req);
+  }
+
+  /// Returns the blocking [ReverseSwapInfo]s that are in progress
+  Future<List<ReverseSwapInfo>> inProgressOnchainPayments() async => _lnToolkit.inProgressOnchainPayments();
 
   /// Fetches the current recommended fees
   Future<RecommendedFees> recommendedFees() async => await _lnToolkit.recommendedFees();
@@ -400,7 +462,11 @@ class BreezSDK {
   }
 
   /// Fetches the service health check from the support API.
-  Future<ServiceHealthCheckResponse> serviceHealthCheck() async => await _lnToolkit.serviceHealthCheck();
+  Future<ServiceHealthCheckResponse> serviceHealthCheck({
+    required String apiKey,
+  }) async {
+    return await _lnToolkit.serviceHealthCheck(apiKey: apiKey);
+  }
 
   /* CLI API's */
 
@@ -408,6 +474,12 @@ class BreezSDK {
   /// Mainly used to debugging.
   Future<String> executeCommand({required String command}) async {
     return await _lnToolkit.executeCommand(command: command);
+  }
+
+  /// Generate diagnostic data.
+  /// Mainly used to debugging.
+  Future<String> generateDiagnosticData() async {
+    return await _lnToolkit.generateDiagnosticData();
   }
 
   /* Helper Methods */
@@ -429,11 +501,66 @@ class BreezSDK {
     await nodeInfo();
     await listPayments(req: const ListPaymentsRequest());
   }
+
+  /// Subscribes to SDK events & log streams.
+  void _subscribeToSdkStreams() {
+    _subscribeToEventsStream();
+    _subscribeToLogStream();
+  }
+
+  /// Subscribes to BreezEvent's(new block, invoice paid, synced) stream
+  void _subscribeToEventsStream() {
+    _breezEventsSubscription = _breezEventsStream?.listen(
+      (event) async {
+        if (event is BreezEvent_InvoicePaid) {
+          _invoicePaidStream.add(event.details);
+          await fetchNodeData();
+        }
+        if (event is BreezEvent_Synced) {
+          await fetchNodeData();
+        }
+        if (event is BreezEvent_PaymentSucceed) {
+          _paymentResultStream.add(event.details);
+        }
+        if (event is BreezEvent_PaymentFailed) {
+          _paymentResultStream.addError(PaymentException(event.details));
+        }
+        if (event is BreezEvent_BackupSucceeded) {
+          _backupStreamController.add(event);
+        }
+        if (event is BreezEvent_BackupStarted) {
+          _backupStreamController.add(event);
+        }
+        if (event is BreezEvent_BackupFailed) {
+          _backupStreamController.addError(BackupException(event.details));
+        }
+        if (event is BreezEvent_SwapUpdated) {
+          _swapEventsStreamController.add(event);
+        }
+      },
+    );
+  }
+
+  /// Subscribes to node logs stream
+  void _subscribeToLogStream() {
+    _breezLogSubscription = _breezLogStream?.listen((logEntry) {
+      _logStreamController.add(logEntry);
+    }, onError: (e) {
+      _logStreamController.addError(e);
+    });
+  }
+
+  /// Unsubscribes from SDK events & log streams.
+  void _unsubscribeFromSdkStreams() {
+    _breezEventsSubscription?.cancel();
+    _breezLogSubscription?.cancel();
+  }
 }
 
 extension SDKConfig on Config {
   Config copyWith({
     String? breezserver,
+    String? chainnotifierUrl,
     String? mempoolspaceUrl,
     String? workingDir,
     Network? network,
@@ -446,6 +573,7 @@ extension SDKConfig on Config {
   }) {
     return Config(
       breezserver: breezserver ?? this.breezserver,
+      chainnotifierUrl: chainnotifierUrl ?? this.chainnotifierUrl,
       mempoolspaceUrl: mempoolspaceUrl ?? this.mempoolspaceUrl,
       workingDir: workingDir ?? this.workingDir,
       network: network ?? this.network,

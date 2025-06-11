@@ -1,0 +1,4 @@
+module breez_sdkFFI {
+    header "breez_sdkFFI.h"
+    export *
+}

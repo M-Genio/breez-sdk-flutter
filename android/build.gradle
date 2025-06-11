@@ -1,8 +1,8 @@
 group 'com.breez.breez_sdk'
-version '0.2.15'
+version '0.8.0'
 
 buildscript {
-    ext.kotlin_version = '1.7.10'
+    ext.kotlin_version = '1.8.20'
     repositories {
         google()
         mavenCentral()
@@ -11,6 +11,7 @@ buildscript {
     dependencies {
         classpath 'com.android.tools.build:gradle:4.2.2'
         classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+        classpath "org.jetbrains.kotlin:kotlin-serialization:$kotlin_version"
     }
 }
 
@@ -24,17 +25,23 @@ rootProject.allprojects {
 
 apply plugin: 'com.android.library'
 apply plugin: 'kotlin-android'
+apply plugin: 'kotlinx-serialization'
 
 android {
-    compileSdkVersion 31
+    // Conditional for compatibility with AGP <4.2.
+    if (project.android.hasProperty("namespace")) {
+      namespace "$group"
+    }
+
+    compileSdk 35
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 
     kotlinOptions {
-        jvmTarget = '1.8'
+        jvmTarget = '11'
     }
 
     sourceSets {
@@ -42,11 +49,16 @@ android {
     }
 
     defaultConfig {
-        minSdkVersion 21
+        ndkVersion = flutter.ndkVersion
+        minSdk = 24
     }
 }
 
 dependencies {
     api "breez_sdk:bindings-android:$version"
-    implementation "net.java.dev.jna:jna:5.8.0@aar"
+    implementation("net.java.dev.jna:jna:5.14.0@aar") {
+        exclude group: 'net.java.dev.jna', module: 'jna'
+    }
+    /* JSON serialization */
+    implementation 'org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3'
 }
